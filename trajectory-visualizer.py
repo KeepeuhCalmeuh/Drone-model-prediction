@@ -6,6 +6,9 @@ DATA_GROUNDTRUTH = "datasets/groundtruth.txt"
 # We will read the ground truth data from the file and store it in a DataFrame
 # The file is composed of 8 columns: timestamp, x, y, z, qx, qy, qz, qw
 # We will first simply show the trajectory in 3D space using the x, y, z columns
+#
+# We will use the dataset of the Zurich University
+# reachable here : https://fpv.ifi.uzh.ch/datasets/.
 
 def read_groundtruth(file_path):
     # Read the data from the file using pandas
@@ -43,9 +46,6 @@ def groundtruth_extented(filepath):
     df["ay"] = df["vy"].diff()
     df["az"] = df["vz"].diff()
     return df
-
-import numpy as np
-import matplotlib.pyplot as plt
 
 def plot_trajectory_w_velocity(df, step=100):
     """
