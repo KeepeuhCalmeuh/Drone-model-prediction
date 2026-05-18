@@ -1,386 +1,319 @@
 """
-Extended Kalman Filter for drone trajectory prediction.
-Fuses IMU data (angular velocity + linear acceleration) with ground truth positions.
+Improved EKF for drone inertial tracking.
 
-State vector: [x, y, z, vx, vy, vz, ax, ay, az]  (9D)
-Observations:  [x, y, z]                           (3D, from groundtruth)
+Main fixes over the original version:
+- Uses IMU acceleration as CONTROL INPUT instead of state overwrite
+- Uses gyroscope to propagate orientation
+- Rotates body acceleration into world frame
+- Removes gravity correctly
+- Uses quaternion attitude
+- Models accel/gyro biases
+- More realistic covariance propagation
 
-Usage:
-    python ekf_drone.py --gt datasets/groundtruth.txt --imu datasets/unimu.txt
+State vector (16D):
+    x = [
+        px, py, pz,
+        vx, vy, vz,
+        qx, qy, qz, qw,
+        bax, bay, baz,
+        bgx, bgy, bgz
+    ]
+
+Observation:
+    z = [px, py, pz]
+
+
+
+    Cependant : 
+    - Jacobienne encore simplifiée
+    - Pas d'error-state EKF
+    - Pas de propagation covariance attitude complète
+    - Pas de modèle IMU discret exact
+    - Pas de Mahalanobis gating
+    - Pas de robustification numérique (Joseph form)
 """
 
 import numpy as np
 import pandas as pd
+from scipy.spatial.transform import Rotation
+from scipy.interpolate import interp1d
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-import argparse
-import os
 
-# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────
 # Data loading
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
 def load_groundtruth(path):
-    df = pd.read_csv(path, sep=r'\s+', header=None, comment='#',
-                     names=['timestamp','x','y','z','qx','qy','qz','qw'])
-    df = df.sort_values('timestamp').reset_index(drop=True)
-    return df
+    df = pd.read_csv(
+        path,
+        sep=r"\s+",
+        header=None,
+        comment="#",
+        names=["timestamp", "x", "y", "z", "qx", "qy", "qz", "qw"]
+    )
+    return df.sort_values("timestamp").reset_index(drop=True)
+
 
 def load_imu(path):
-    df = pd.read_csv(path, sep=r'\s+', header=None, comment='#',
-                     names=['idx','timestamp',
-                            'ang_vel_x','ang_vel_y','ang_vel_z',
-                            'lin_acc_x','lin_acc_y','lin_acc_z'])
-    df = df.sort_values('timestamp').reset_index(drop=True)
-    return df
+    df = pd.read_csv(
+        path,
+        sep=r"\s+",
+        header=None,
+        comment="#",
+        names=[
+            "idx", "timestamp",
+            "gx", "gy", "gz",
+            "ax", "ay", "az"
+        ]
+    )
+    return df.sort_values("timestamp").reset_index(drop=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# EKF — state: [x, y, z, vx, vy, vz, ax, ay, az]
-# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────
+# Quaternion utilities
+# ─────────────────────────────────────────────────────────────
+
+def quat_normalize(q):
+    return q / np.linalg.norm(q)
+
+
+def integrate_quaternion(q, omega, dt):
+    """
+    Quaternion integration using small-angle approximation.
+    omega: rad/s
+    """
+    angle = np.linalg.norm(omega) * dt
+
+    if angle < 1e-12:
+        return q
+
+    axis = omega / np.linalg.norm(omega)
+
+    dq = Rotation.from_rotvec(axis * angle).as_quat()
+
+    q_new = (Rotation.from_quat(q) * Rotation.from_quat(dq)).as_quat()
+
+    return quat_normalize(q_new)
+
+
+# ─────────────────────────────────────────────────────────────
+# EKF
+# ─────────────────────────────────────────────────────────────
 
 class DroneEKF:
-    """
-    Extended Kalman Filter for drone dead-reckoning + position correction.
 
-    Prediction step  → physics model using IMU accelerations
-    Update step      → position correction from ground truth (or GPS)
-    """
+    def __init__(self):
 
-    def __init__(self, x0, P0, Q, R):
-        """
-        Args:
-            x0  : initial state (9,)     [x,y,z, vx,vy,vz, ax,ay,az]
-            P0  : initial covariance (9,9)
-            Q   : process noise (9,9)    — how much we trust the model
-            R   : measurement noise (3,3)— how much we trust position obs
-        """
-        self.x = x0.copy()         # state estimate
-        self.P = P0.copy()         # state covariance
-        self.Q = Q                 # process noise covariance
-        self.R = R                 # measurement noise covariance
+        self.n = 16
 
-        # Observation matrix: we only observe position (x, y, z)
-        self.H = np.zeros((3, 9))
-        self.H[0, 0] = 1.0
-        self.H[1, 1] = 1.0
-        self.H[2, 2] = 1.0
+        self.x = np.zeros(self.n)
 
-    def _state_transition(self, dt, imu_acc):
-        """
-        Physics model: constant-acceleration kinematics.
-        The IMU acceleration is used to update the acceleration state,
-        then propagated through to velocity and position.
+        # quaternion
+        self.x[9] = 1.0
 
-        x_{k+1} = F x_k  (with acceleration input from IMU)
-        """
-        F = np.eye(9)
-        # position ← position + velocity*dt + 0.5*acc*dt²
-        F[0, 3] = dt;  F[0, 6] = 0.5 * dt**2
-        F[1, 4] = dt;  F[1, 7] = 0.5 * dt**2
-        F[2, 5] = dt;  F[2, 8] = 0.5 * dt**2
-        # velocity ← velocity + acceleration*dt
-        F[3, 6] = dt
-        F[4, 7] = dt
-        F[5, 8] = dt
-        # acceleration ← stays (updated by IMU below)
+        self.P = np.eye(self.n) * 0.1
 
-        x_pred = F @ self.x
+        # Process noise
+        q_pos = 1e-4
+        q_vel = 1e-2
+        q_att = 1e-3
+        q_ba  = 1e-5
+        q_bg  = 1e-6
 
-        # Override acceleration with fresh IMU reading
-        x_pred[6] = imu_acc[0]
-        x_pred[7] = imu_acc[1]
-        x_pred[8] = imu_acc[2]
+        self.Q = np.diag(
+            [q_pos]*3 +
+            [q_vel]*3 +
+            [q_att]*4 +
+            [q_ba]*3 +
+            [q_bg]*3
+        )
 
-        return x_pred, F
+        # Position measurement noise
+        self.R = np.diag([0.03, 0.03, 0.03])
 
-    def predict(self, dt, imu_acc):
-        """Prediction step: propagate state with IMU acceleration."""
-        x_pred, F = self._state_transition(dt, imu_acc)
-        P_pred = F @ self.P @ F.T + self.Q
+        # Position observation model
+        self.H = np.zeros((3, self.n))
+        self.H[0, 0] = 1
+        self.H[1, 1] = 1
+        self.H[2, 2] = 1
 
-        self.x = x_pred
-        self.P = P_pred
+        self.g = np.array([0, 0, -9.81])
+
+    # ---------------------------------------------------------
+
+    def predict(self, dt, accel_meas, gyro_meas):
+
+        p = self.x[0:3]
+        v = self.x[3:6]
+        q = self.x[6:10]
+        ba = self.x[10:13]
+        bg = self.x[13:16]
+
+        # Bias-corrected IMU
+        accel = accel_meas - ba
+        gyro  = gyro_meas  - bg
+
+        # Update attitude
+        q = integrate_quaternion(q, gyro, dt)
+
+        # Rotate accel body -> world
+        Rwb = Rotation.from_quat(q).as_matrix()
+
+        a_world = Rwb @ accel + self.g
+
+        # Kinematics
+        p_new = p + v * dt + 0.5 * a_world * dt**2
+        v_new = v + a_world * dt
+
+        # Write back
+        self.x[0:3] = p_new
+        self.x[3:6] = v_new
+        self.x[6:10] = q
+
+        # Linearized covariance propagation
+        F = np.eye(self.n)
+
+        F[0, 3] = dt
+        F[1, 4] = dt
+        F[2, 5] = dt
+
+        self.P = F @ self.P @ F.T + self.Q
+
+    # ---------------------------------------------------------
 
     def update(self, z):
-        """
-        Update step: correct with position measurement z = [x, y, z].
 
-        Innovation:    y = z - H x_pred
-        Kalman gain:   K = P H^T (H P H^T + R)^{-1}
-        State update:  x = x_pred + K y
-        Cov update:    P = (I - K H) P
-        """
-        y = z - self.H @ self.x                             # innovation
-        S = self.H @ self.P @ self.H.T + self.R             # innovation covariance
-        K = self.P @ self.H.T @ np.linalg.inv(S)            # Kalman gain
+        y = z - self.H @ self.x
+
+        S = self.H @ self.P @ self.H.T + self.R
+
+        K = self.P @ self.H.T @ np.linalg.inv(S)
 
         self.x = self.x + K @ y
-        self.P = (np.eye(9) - K @ self.H) @ self.P
 
-        return y, K                                          # useful for diagnostics
+        I = np.eye(self.n)
 
-    def predict_ahead(self, n_steps, dt):
-        """
-        Pure prediction (no update) — used for 'real-time' forward horizon.
-        Returns predicted positions over the next n_steps.
-        """
-        x = self.x.copy()
-        P = self.P.copy()
-        F = np.eye(9)
-        F[0,3]=dt; F[0,6]=0.5*dt**2
-        F[1,4]=dt; F[1,7]=0.5*dt**2
-        F[2,5]=dt; F[2,8]=0.5*dt**2
-        F[3,6]=dt; F[4,7]=dt; F[5,8]=dt
+        self.P = (I - K @ self.H) @ self.P
 
-        positions = []
-        for _ in range(n_steps):
-            x = F @ x
-            positions.append(x[:3].copy())
-        return np.array(positions)
+        # normalize quaternion
+        self.x[6:10] = quat_normalize(self.x[6:10])
+
+        return y
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main pipeline
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────
 
-def run_ekf(gt_path, imu_path,
-            imu_update_ratio=10,     # use 1 GT position every N IMU steps
-            prediction_horizon=50,   # steps to predict ahead
-            use_gt_updates=True):    # False = pure dead-reckoning (no GT)
-    """
-    Main EKF loop.
+def run_ekf(gt_path, imu_path):
 
-    The IMU runs at ~1 kHz; ground truth at ~100 Hz.
-    We interpolate GT timestamps to align with IMU.
-    """
-
-    print("Loading data...")
-    gt  = load_groundtruth(gt_path)
+    gt = load_groundtruth(gt_path)
     imu = load_imu(imu_path)
 
-    # ── Align time ranges ────────────────────────────────────────────────────
-    t_start = max(gt['timestamp'].iloc[0],  imu['timestamp'].iloc[0])
-    t_end   = min(gt['timestamp'].iloc[-1], imu['timestamp'].iloc[-1])
+    # Align time range
+    t0 = max(gt.timestamp.iloc[0], imu.timestamp.iloc[0])
+    t1 = min(gt.timestamp.iloc[-1], imu.timestamp.iloc[-1])
 
-    gt  = gt[(gt['timestamp']  >= t_start) & (gt['timestamp']  <= t_end)].reset_index(drop=True)
-    imu = imu[(imu['timestamp'] >= t_start) & (imu['timestamp'] <= t_end)].reset_index(drop=True)
+    gt = gt[(gt.timestamp >= t0) & (gt.timestamp <= t1)]
+    imu = imu[(imu.timestamp >= t0) & (imu.timestamp <= t1)]
 
-    if len(imu) == 0 or len(gt) == 0:
-        raise ValueError("No overlapping timestamps between IMU and ground truth.")
-
-    print(f"  IMU samples : {len(imu)}")
-    print(f"  GT  samples : {len(gt)}")
-
-    # ── Initialisation ────────────────────────────────────────────────────────
-    x0 = np.zeros(9)
-    x0[0] = gt['x'].iloc[0]
-    x0[1] = gt['y'].iloc[0]
-    x0[2] = gt['z'].iloc[0]
-
-    # Process noise — tune these to your drone dynamics
-    q_pos  = 0.01   # position drift
-    q_vel  = 0.1    # velocity drift
-    q_acc  = 1.0    # acceleration drift (IMU noise dominates)
-
-    Q = np.diag([q_pos]*3 + [q_vel]*3 + [q_acc]*3)
-
-    # Measurement noise — how noisy is your position sensor?
-    r_pos = 0.05    # 5 cm position noise (UZH dataset is quite precise)
-    R = np.diag([r_pos]*3)
-
-    P0 = np.diag([0.1]*3 + [1.0]*3 + [5.0]*3)
-
-    ekf = DroneEKF(x0, P0, Q, R)
-
-    # ── GT interpolator (for update step) ────────────────────────────────────
-    from scipy.interpolate import interp1d
+    # GT interpolation
     gt_interp = {
-        ax: interp1d(gt['timestamp'], gt[ax], bounds_error=False, fill_value='extrapolate')
-        for ax in ['x','y','z']
+        ax: interp1d(
+            gt.timestamp,
+            gt[ax],
+            bounds_error=False,
+            fill_value="extrapolate"
+        )
+        for ax in ["x", "y", "z"]
     }
 
-    # ── Main loop ─────────────────────────────────────────────────────────────
-    estimated   = []   # filtered trajectory
-    predicted   = []   # pure prediction (no GT)
-    innovations = []   # innovation norm (filter health)
-    timestamps  = []
+    ekf = DroneEKF()
 
-    t_prev = imu['timestamp'].iloc[0]
+    # Init position
+    ekf.x[0] = gt.x.iloc[0]
+    ekf.x[1] = gt.y.iloc[0]
+    ekf.x[2] = gt.z.iloc[0]
 
-    print("Running EKF...")
+    est = []
+
+    t_prev = imu.timestamp.iloc[0]
+
     for i, row in imu.iterrows():
-        t     = row['timestamp']
-        dt    = t - t_prev
+
+        t = row.timestamp
+        dt = t - t_prev
+
         if dt <= 0:
             continue
 
-        imu_acc = np.array([row['lin_acc_x'], row['lin_acc_y'], row['lin_acc_z']])
+        accel = np.array([row.ax, row.ay, row.az])
+        gyro  = np.array([row.gx, row.gy, row.gz])
 
-        # Gravity removal (approximation — proper version needs orientation)
-        # The IMU measures specific force = acceleration - gravity
-        # For now we subtract gravity along the dominant axis (z≈-9.8)
-        GRAVITY = np.array([0.0, 0.0, -9.81])
-        world_acc = imu_acc + GRAVITY      # crude: works when drone is mostly flat
+        # Prediction
+        ekf.predict(dt, accel, gyro)
 
-        # ── Predict ──────────────────────────────────────────────────────────
-        ekf.predict(dt, world_acc)
+        # Update every 10 IMU steps
+        if i % 10 == 0:
 
-        # ── Update (every imu_update_ratio steps) ────────────────────────────
-        if use_gt_updates and (i % imu_update_ratio == 0):
-            z = np.array([gt_interp[ax](t) for ax in ['x','y','z']])
-            inno, K = ekf.update(z)
-            innovations.append(np.linalg.norm(inno))
+            z = np.array([
+                gt_interp["x"](t),
+                gt_interp["y"](t),
+                gt_interp["z"](t)
+            ])
 
-        estimated.append(ekf.x[:3].copy())
-        timestamps.append(t)
+            ekf.update(z)
+
+        est.append(ekf.x[:3].copy())
+
         t_prev = t
 
-        if i % 5000 == 0:
-            print(f"  Step {i}/{len(imu)}", end='\r')
-
-    print(f"\nDone. {len(estimated)} steps processed.")
-
-    estimated   = np.array(estimated)
-    gt_xyz      = gt[['x','y','z']].values
-    timestamps  = np.array(timestamps)
-
-    # ── Forward prediction from last state ───────────────────────────────────
-    dt_mean = np.mean(np.diff(timestamps[-100:]))
-    future_positions = ekf.predict_ahead(prediction_horizon, dt_mean)
-
-    return {
-        'estimated'       : estimated,
-        'groundtruth'     : gt_xyz,
-        'future'          : future_positions,
-        'timestamps'      : timestamps,
-        'gt_timestamps'   : gt['timestamp'].values,
-        'innovations'     : np.array(innovations) if innovations else np.array([]),
-        'final_state'     : ekf.x,
-        'final_cov_diag'  : np.diag(ekf.P),
-    }
+    return np.array(est), gt
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Visualisation
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Visualization
+# ─────────────────────────────────────────────────────────────
 
-def plot_results(results):
-    est = results['estimated']
-    gt  = results['groundtruth']
-    fut = results['future']
-    inn = results['innovations']
+def plot_results(est, gt):
 
-    fig = plt.figure(figsize=(18, 10))
-    fig.suptitle('EKF — Drone trajectory estimation & prediction', fontsize=14)
+    gt_xyz = gt[["x", "y", "z"]].values
 
-    # ── 3D trajectory ─────────────────────────────────────────────────────────
-    ax1 = fig.add_subplot(2, 3, (1, 4), projection='3d')
-    ax1.plot(gt[:,0],  gt[:,1],  gt[:,2],  'k-',  lw=0.8, alpha=0.5, label='Ground truth')
-    ax1.plot(est[:,0], est[:,1], est[:,2], 'b-',  lw=1.0, alpha=0.8, label='EKF estimate')
-    ax1.plot(fut[:,0], fut[:,1], fut[:,2], 'r--', lw=1.5, label=f'Prediction ({len(fut)} steps)')
-    ax1.scatter(*est[-1],  c='blue',  s=30, zorder=5)
-    ax1.scatter(*fut[-1],  c='red',   s=50, zorder=5, label='Predicted end')
-    ax1.set_xlabel('X (m)'); ax1.set_ylabel('Y (m)'); ax1.set_zlabel('Z (m)')
-    ax1.legend(fontsize=8)
-    ax1.set_title('3D trajectory')
+    fig = plt.figure(figsize=(12, 8))
 
-    # ── Per-axis comparison ───────────────────────────────────────────────────
-    t_est = results['timestamps']
-    t_gt  = results['gt_timestamps']
-    # Align to relative time
-    t0    = t_est[0]
-    t_rel = t_est - t0
-    tg_rel = t_gt - t0
+    ax = fig.add_subplot(111, projection="3d")
 
-    for idx, (axis, col) in enumerate([('X','b'),('Y','g'),('Z','r')]):
-        ax = fig.add_subplot(2, 3, idx + 2)   # top row: 2,3,4 (skip 1 taken by 3D)
-        # Avoid 2,3 overlap: use right column
-        ax = fig.add_subplot(2, 3, idx + 2)
+    ax.plot(
+        gt_xyz[:, 0],
+        gt_xyz[:, 1],
+        gt_xyz[:, 2],
+        label="Ground truth"
+    )
 
-        gt_col = gt[:, idx]
-        ax.plot(tg_rel[:len(gt_col)], gt_col,  'k-',  lw=0.7, alpha=0.5, label='GT')
-        ax.plot(t_rel, est[:, idx],  c=col, lw=1.0, alpha=0.9, label='EKF')
-        ax.set_title(f'{axis} position (m)')
-        ax.set_xlabel('Time (s)')
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
+    ax.plot(
+        est[:, 0],
+        est[:, 1],
+        est[:, 2],
+        label="EKF"
+    )
 
-    # ── Innovation norm ───────────────────────────────────────────────────────
-    ax5 = fig.add_subplot(2, 3, 6)
-    if len(inn) > 0:
-        ax5.plot(inn, 'orange', lw=1.0)
-        ax5.set_title('Innovation norm (filter health)')
-        ax5.set_xlabel('Update step')
-        ax5.set_ylabel('||y|| (m)')
-        ax5.axhline(np.mean(inn), color='red', ls='--', lw=0.8, label=f'Mean: {np.mean(inn):.3f} m')
-        ax5.legend(fontsize=8)
-        ax5.grid(True, alpha=0.3)
-    else:
-        ax5.text(0.5, 0.5, 'No updates\n(pure dead-reckoning)',
-                 ha='center', va='center', transform=ax5.transAxes)
-        ax5.set_title('Innovation norm')
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
 
-    plt.tight_layout()
-    plt.savefig('ekf_results.png', dpi=150, bbox_inches='tight')
+    ax.legend()
+
     plt.show()
 
-    # ── Print summary ─────────────────────────────────────────────────────────
-    from scipy.interpolate import interp1d
-    t_gt  = results['gt_timestamps']
-    t0    = results['timestamps'][0]
-    gt_interp_x = interp1d(t_gt, gt[:,0], bounds_error=False, fill_value='extrapolate')
-    gt_interp_y = interp1d(t_gt, gt[:,1], bounds_error=False, fill_value='extrapolate')
-    gt_interp_z = interp1d(t_gt, gt[:,2], bounds_error=False, fill_value='extrapolate')
 
-    t_eval = results['timestamps'][::10]
-    gt_at_t = np.column_stack([
-        gt_interp_x(t_eval),
-        gt_interp_y(t_eval),
-        gt_interp_z(t_eval),
-    ])
-    est_at_t = results['estimated'][::10]
-    n = min(len(gt_at_t), len(est_at_t))
-    rmse = np.sqrt(np.mean(np.sum((gt_at_t[:n] - est_at_t[:n])**2, axis=1)))
+# ─────────────────────────────────────────────────────────────
 
-    print("\n── EKF Summary ──────────────────────────────────")
-    print(f"  RMSE (position)      : {rmse:.4f} m")
-    print(f"  Final state x,y,z    : {results['final_state'][:3]}")
-    print(f"  Final state vx,vy,vz : {results['final_state'][3:6]}")
-    print(f"  State covariance diag: {results['final_cov_diag'][:6].round(4)}")
-    if len(inn) > 0:
-        print(f"  Mean innovation      : {np.mean(inn):.4f} m")
-    print(f"  Predicted next pos   : {results['future'][-1].round(3)} m")
-    print("─────────────────────────────────────────────────")
+if __name__ == "__main__":
 
+    GT_PATH  = "datasets/groundtruth.txt"
+    IMU_PATH = "datasets/imu.txt"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────────────────────────────────────
+    est, gt = run_ekf(GT_PATH, IMU_PATH)
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='EKF drone trajectory estimation')
-    parser.add_argument('--gt',      default='datasets/groundtruth.txt',
-                        help='Path to groundtruth.txt')
-    parser.add_argument('--imu',     default='datasets/unimu.txt',
-                        help='Path to unimu.txt')
-    parser.add_argument('--horizon', type=int, default=50,
-                        help='Number of future steps to predict')
-    parser.add_argument('--no-updates', action='store_true',
-                        help='Disable GT updates (pure IMU dead-reckoning)')    
-    args = parser.parse_args()
-
-    if not os.path.exists(args.gt):
-        print(f"Ground truth not found: {args.gt}")
-        exit(1)
-    if not os.path.exists(args.imu):
-        print(f"IMU file not found: {args.imu}")
-        exit(1)
-
-    results = run_ekf(
-        gt_path=args.gt,
-        imu_path=args.imu,
-        prediction_horizon=args.horizon,
-        use_gt_updates=not args.no_updates,
-    )
-    plot_results(results)
-# python ekf_drone.py --gt datasets/groundtruth.txt --imu datasets/imu.txt --horizon 50
+    plot_results(est, gt)
